@@ -22,6 +22,10 @@ FETCH_INTERVAL = 10 * 60  # 10 minutes
 DEFAULT_SOLVE_INTERVAL = 2 * 60  # 2 minutes
 DEFAULT_SAVE_INTERVAL = 10 * 60  # 10 minutes
 
+# Submission retry tuning
+MAX_SUBMIT_RETRIES = 5
+BASE_BACKOFF_SECONDS = 2.0  # 2s, then 4s, 8s, 16s, ...
+TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 
 # --- HTTP Session Setup ---
 session = requests.Session()
@@ -45,6 +49,87 @@ def setup_logging():
     # Silence noisy libraries
     logging.getLogger("requests").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
+def _is_transient_request_exception(exc):
+    """
+    Decide whether a RequestException from curl_cffi is worth retrying.
+    Looks at HTTP status (if present) and common network timeout wording.
+    """
+    # If the exception has a .response with a status_code, inspect it
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None)
+    if status in TRANSIENT_STATUS_CODES:
+        return True
+
+    # Fallback to message-based detection for curl (28) etc.
+    msg = str(exc).lower()
+    timeout_keywords = [
+        "timed out",
+        "timeout",
+        "temporary failure",
+        "connection reset",
+        "connection refused",
+        "could not resolve",
+    ]
+    return any(k in msg for k in timeout_keywords)
+
+
+def submit_with_retry(submit_url, tui_app, challenge_id, stop_event):
+    """
+    POSTs the solution with retries on transient errors.
+    Returns the successful response, or raises the final exception.
+    """
+    attempt = 0
+    backoff = BASE_BACKOFF_SECONDS
+    last_exc = None
+
+    while attempt < MAX_SUBMIT_RETRIES and not stop_event.is_set():
+        attempt += 1
+        try:
+            resp = session.post(submit_url, timeout=30)
+
+            # If the server is up but overloaded, we may still want to retry
+            if (
+                resp.status_code in TRANSIENT_STATUS_CODES
+                and attempt < MAX_SUBMIT_RETRIES
+            ):
+                tui_app.post_message(
+                    LogMessage(
+                        f"Transient HTTP {resp.status_code} submitting {challenge_id} "
+                        f"(attempt {attempt}/{MAX_SUBMIT_RETRIES}), "
+                        f"retrying in {backoff:.1f}s..."
+                    )
+                )
+                stop_event.wait(backoff)
+                backoff *= 2
+                continue
+
+            # For all other statuses, either OK or a hard error
+            resp.raise_for_status()
+            return resp
+
+        except requests.exceptions.RequestException as e:  # type: ignore
+            last_exc = e
+            if _is_transient_request_exception(e) and attempt < MAX_SUBMIT_RETRIES:
+                tui_app.post_message(
+                    LogMessage(
+                        f"Transient error submitting {challenge_id} "
+                        f"(attempt {attempt}/{MAX_SUBMIT_RETRIES}): {e}. "
+                        f"Retrying in {backoff:.1f}s..."
+                    )
+                )
+                stop_event.wait(backoff)
+                backoff *= 2
+                continue
+
+            # Non-transient or out of retries → bubble up
+            raise
+
+    # If we exited because of stop_event, just raise the last exception if any
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"submit_with_retry aborted for {challenge_id}")
 
 
 # --- DatabaseManager for Thread-Safe Operations ---
@@ -297,8 +382,9 @@ def _solve_one_challenge(db_manager, tui_app, stop_event, address, challenge):
         submit_url = (
             f"https://sm.midnight.gd/api/solution/{address}/{c['challengeId']}/{nonce}"
         )
-        submit_response = session.post(submit_url)
-        submit_response.raise_for_status()
+        submit_response = submit_with_retry(
+            submit_url, tui_app, c["challengeId"], stop_event
+        )
         validated_time = datetime.now(timezone.utc)
         tui_app.post_message(
             LogMessage(f"Solution submitted successfully for {c['challengeId']}")
